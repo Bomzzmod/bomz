@@ -118,66 +118,169 @@ jobs:
       # FLUTTER
       # =========================
       - name: Setup Flutter
-        uses: subosito/flutter-action@main
+        uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.41.9"
           channel: "stable"
           cache: true
 
       # ==========================================================
-      # 🛠️ FIX FLUTTER SDK PATH
+      # 🛠️ FIX FLUTTER SDK PATH (AGGRESSIVE MODE)
       # ==========================================================
-      # ZIP project bisa membawa android/local.properties dari Windows
-      # (contoh: flutter.sdk=D:\\flutter). GitHub Actions berjalan di
-      # Linux, sehingga path tersebut menyebabkan:
-      # URISyntaxException: Illegal character in opaque part
+      # ZIP project sering membawa path Windows hardcoded
+      # (contoh: C:\flutter, C:/flutter, D:\flutter) di
+      # berbagai file konfigurasi Gradle.
+      # Error yang muncul:
+      #   URISyntaxException: Illegal character in opaque part
       #
-      # Hanya nilai flutter.sdk yang dinormalisasi. Alur build, bot,
-      # dependency, dan konfigurasi project lainnya tidak diubah.
+      # Step ini:
+      # 1) Fix android/local.properties
+      # 2) Hapus cache build lama yang ikut ter-zip
+      # 3) Scan & replace SEMUA path Windows Flutter -> Linux
+      # 4) Verifikasi akhir
       # ==========================================================
       - name: Normalize Flutter SDK path
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          echo "=== Normalizing Flutter SDK path ==="
+          echo "=== Normalizing Flutter SDK path (aggressive) ==="
           echo "Runner OS: $RUNNER_OS"
           echo "Flutter SDK: $FLUTTER_ROOT"
 
+          # ---------- 1) Sanitize android/local.properties ----------
           LOCAL_PROPS="android/local.properties"
-
           if [ -f "$LOCAL_PROPS" ]; then
             echo "📄 Found $LOCAL_PROPS"
-
-            # Hapus flutter.sdk lama (termasuk path Windows seperti D:\\flutter)
-            # lalu tulis path Flutter SDK milik runner GitHub Actions.
             grep -vE '^[[:space:]]*flutter\.sdk[[:space:]]*=' "$LOCAL_PROPS" > "$LOCAL_PROPS.tmp" || true
             mv "$LOCAL_PROPS.tmp" "$LOCAL_PROPS"
-            printf 'flutter.sdk=%s\\n' "$FLUTTER_ROOT" >> "$LOCAL_PROPS"
-
-            echo "✅ flutter.sdk diperbarui ke Flutter SDK runner."
+            printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT" >> "$LOCAL_PROPS"
+            echo "✅ flutter.sdk diperbarui."
           else
             echo "ℹ️ android/local.properties tidak ditemukan, membuat file baru."
-
             mkdir -p android
-            printf 'flutter.sdk=%s\\n' "$FLUTTER_ROOT" > "$LOCAL_PROPS"
+            printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT" > "$LOCAL_PROPS"
+          fi
+
+          # ---------- 2) Buang cache build lama yang ikut ter-zip ----------
+          echo ""
+          echo "=== Membersihkan cache/folder build lama dari ZIP ==="
+          rm -rf android/.gradle android/build android/app/build build .dart_tool 2>/dev/null || true
+          find . -name ".gradle" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find . -name "build" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          echo "✅ Cache lama dibersihkan."
+
+          # ---------- 3) Ganti SEMUA path Windows Flutter -> Linux ----------
+          echo ""
+          echo "=== Memindai path Windows hardcoded di seluruh project ==="
+
+          FILES_TO_FIX=$(grep -RIlE '([A-Za-z]:[/\\]+flutter)|(C:[/\\]+flutter)' \
+            --include="*.gradle" \
+            --include="*.properties" \
+            --include="*.kts" \
+            --include="*.xml" \
+            --include="*.json" \
+            --include="*.yaml" \
+            --include="*.yml" \
+            . 2>/dev/null || true)
+
+          if [ -z "$FILES_TO_FIX" ]; then
+            echo "✅ Tidak ada path Windows Flutter di file konfigurasi."
+          else
+            echo "📄 File yang akan diperbaiki:"
+            echo "$FILES_TO_FIX"
+
+            for f in $FILES_TO_FIX; do
+              echo "  🔧 Fix: $f"
+              sed -i -E \
+                "s#([A-Za-z]:[\\\\/]+flutter)#${FLUTTER_ROOT}#g" \
+                "$f"
+            done
+            echo "✅ Selesai memperbaiki file."
+          fi
+
+          # ---------- 4) Verifikasi ----------
+          echo ""
+          echo "=== Verifikasi akhir: cek sisa path Windows ==="
+          REMAINING=$(grep -RInE '([A-Za-z]:[\\/]+flutter)' \
+            --include="*.gradle" \
+            --include="*.properties" \
+            --include="*.kts" \
+            . 2>/dev/null || true)
+
+          if [ -n "$REMAINING" ]; then
+            echo "⚠️ Masih ada referensi Windows:"
+            echo "$REMAINING"
+            echo "Mencoba fix paksa..."
+            echo "$REMAINING" | while IFS=: read -r file line rest; do
+              sed -i -E "s#([A-Za-z]:[\\\\/]+flutter)#${FLUTTER_ROOT}#g" "$file"
+            done
+          else
+            echo "✅ Bersih. Tidak ada path Windows tersisa."
           fi
 
           echo ""
-          echo "=== Sanitized android/local.properties ==="
-          sed -E 's#(sdk\.dir=).*#\\1<ANDROID_SDK_PATH>#; s#(flutter\.sdk=).*#\\1<FLUTTER_SDK_PATH>#' "$LOCAL_PROPS"
-
-          echo ""
-          echo "=== Checking for hard-coded Windows Flutter path ==="
-          if grep -RInE 'D:[/\\]+flutter|[A-Za-z]:[/\\]+flutter' android 2>/dev/null; then
-            echo "⚠️ Found a Windows Flutter path somewhere under android/."
-            echo "The standard local.properties path was already fixed above."
-          else
-            echo "✅ No hard-coded Windows Flutter path found under android/."
+          echo "=== Isi android/settings.gradle (spot check) ==="
+          if [ -f "android/settings.gradle" ]; then
+            grep -nE "flutter|includeBuild|pluginManagement" android/settings.gradle | head -20
           fi
 
       # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 1: Jalankan & cetak hasil
-      # (Dipisah dari exit 1 biar log tidak ter-truncate)
+      # 🧠 FIX GRADLE MEMORY & WRAPPER
+      # ==========================================================
+      # Menghindari error:
+      #   "The maximum heap size is insufficient"
+      #   "Gradle version X is not compatible with AGP Y"
+      # ==========================================================
+      - name: Fix Gradle Memory & Wrapper
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          echo "=== Fixing Gradle memory & wrapper ==="
+
+          if [ ! -d "android" ]; then
+            echo "ℹ️ Folder android/ tidak ditemukan. Skip."
+            exit 0
+          fi
+
+          GRADLE_PROPS="android/gradle.properties"
+
+          # Buang konfigurasi org.gradle.jvmargs lama (kalau ada),
+          # lalu tulis baru dengan heap 4 GB.
+          if [ -f "$GRADLE_PROPS" ]; then
+            grep -vE '^[[:space:]]*org\.gradle\.jvmargs[[:space:]]*=' "$GRADLE_PROPS" > "$GRADLE_PROPS.tmp" || true
+            mv "$GRADLE_PROPS.tmp" "$GRADLE_PROPS"
+          else
+            touch "$GRADLE_PROPS"
+          fi
+
+          cat >> "$GRADLE_PROPS" << 'EOF'
+          org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+          org.gradle.daemon=false
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+          echo "✅ gradle.properties diperbarui:"
+          cat "$GRADLE_PROPS"
+
+          # Paksa Gradle wrapper ke 8.9 (kompatibel dengan Flutter 3.41+ / AGP 8.x)
+          if [ -f "android/gradlew" ]; then
+            echo ""
+            echo "=== Forcing Gradle wrapper to 8.9 ==="
+            cd android
+            chmod +x gradlew
+            ./gradlew wrapper --gradle-version 8.9 --distribution-type bin || {
+              echo "⚠️ Gagal update wrapper, lanjut dengan wrapper yang ada."
+            }
+            cd ..
+          fi
+
+          echo "✅ Selesai."
+
+      # ==========================================================
+      # 🔍 TAHAP ANALYZE — STEP 1
       # ==========================================================
       - name: Analyze Project Code
         working-directory: ${{ env.PROJECT_DIR }}
@@ -203,14 +306,14 @@ jobs:
           fi
 
       # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 2: Stop workflow jika only_analyze
-      # (Dipisah biar log step di atas sudah ter-commit ke GitHub)
+      # 🔍 TAHAP ANALYZE — STEP 2
       # ==========================================================
       - name: Stop if Analyze Only
         if: ${{ github.event.inputs.only_analyze == 'true' }}
         run: |
           echo "Analyze-only mode aktif. Workflow dihentikan di sini."
-          exit 1
+          # exit 0 = success, karena ini bukan error, cuma mode stop.
+          exit 0
 
       # =========================
       # FLUTTER DOCTOR
@@ -226,7 +329,7 @@ jobs:
         run: |
           echo "=== Running flutter pub get ==="
           if [ -f "pubspec.yaml" ]; then
-            timeout 120s flutter pub get || echo "⚠️ Gagal download package karena network server, coba lanjut aja..."
+            timeout 180s flutter pub get || echo "⚠️ Gagal download package karena network server, coba lanjut aja..."
           else
             echo "☕ Bukan project Flutter standar, skip pub get!"
           fi
@@ -288,7 +391,6 @@ jobs:
 
           echo "✅ APK Sukses Ditemukan di Jalur: $APK_PATH"
           
-          echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
           echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
 
           echo ""
@@ -302,6 +404,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
-          path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
+          path: ${{ github.workspace }}/${{ env.APK_PATH }}
           retention-days: 1
           if-no-files-found: error

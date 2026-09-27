@@ -632,7 +632,8 @@ jobs:
       - name: Download and Sanitize Icon
         run: |
           mkdir -p myapp/assets/icon
-          sudo apt-get install -y imagemagick
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends imagemagick
 
           curl -L \
             -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
@@ -641,11 +642,12 @@ jobs:
             -o myapp/assets/icon/icon_raw
 
           # Mengubah gambar menjadi format PNG 1024x1024 yang valid
-          convert myapp/assets/icon/icon_raw \
+          convert "myapp/assets/icon/icon_raw[0]" \
             -background transparent \
             -gravity center \
             -resize 1024x1024 \
             -extent 1024x1024 \
+            -alpha on -strip \
             myapp/assets/icon/icon.png
 
       - name: Write launcher icons config
