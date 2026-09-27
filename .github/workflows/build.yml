@@ -95,12 +95,9 @@ jobs:
 
           DETECT_DIR="project_raw"
 
-          # Loop sampai ketemu folder yang punya marker project Flutter/Android,
-          # atau mentok karena strukturnya tidak bisa turun lagi.
           for i in 1 2 3 4 5; do
             echo "  [level $i] cek: $DETECT_DIR"
 
-            # Marker project Flutter/Android ditemukan?
             if [ -f "$DETECT_DIR/pubspec.yaml" ] || \
                [ -f "$DETECT_DIR/settings.gradle" ] || \
                [ -f "$DETECT_DIR/settings.gradle.kts" ] || \
@@ -112,7 +109,6 @@ jobs:
               break
             fi
 
-            # Kalau cuma 1 subfolder dan tidak ada file, turun satu level
             SUB_DIR_COUNT=$(find "$DETECT_DIR" -maxdepth 1 -mindepth 1 -type d | wc -l)
             FILE_COUNT=$(find "$DETECT_DIR" -maxdepth 1 -mindepth 1 -type f | wc -l)
 
@@ -121,7 +117,6 @@ jobs:
               continue
             fi
 
-            # Tidak bisa turun lagi
             echo "  ℹ️ Tidak bisa turun lebih dalam, berhenti di: $DETECT_DIR"
             break
           done
@@ -151,11 +146,6 @@ jobs:
 
       # ==========================================================
       # 🛠️ FIX FLUTTER SDK PATH (AGGRESSIVE + SPACE-SAFE)
-      # ==========================================================
-      # Menangani:
-      #  - path Windows hardcoded (C:\flutter, D:/flutter)
-      #  - nama folder project yang mengandung SPASI
-      #  - cache build lama yang ikut ter-zip
       # ==========================================================
       - name: Normalize Flutter SDK path
         working-directory: ${{ env.PROJECT_DIR }}
@@ -192,7 +182,6 @@ jobs:
           echo ""
           echo "=== Memindai path Windows hardcoded di seluruh project ==="
 
-          # Simpan hasil grep ke array supaya aman terhadap spasi pada nama file.
           mapfile -t FILES_TO_FIX < <(grep -RIlE '[A-Za-z]:[\\/]+flutter' \
             --include="*.gradle" \
             --include="*.properties" \
@@ -203,7 +192,6 @@ jobs:
             --include="*.yml" \
             . 2>/dev/null || true)
 
-          # Buang elemen kosong (jaga-jaga)
           CLEAN_FILES=()
           for f in "${FILES_TO_FIX[@]}"; do
             [ -n "$f" ] && CLEAN_FILES+=("$f")
@@ -217,7 +205,6 @@ jobs:
 
             for f in "${CLEAN_FILES[@]}"; do
               echo "  🔧 Fix: $f"
-              # Ganti semua variasi C:\flutter, C:/flutter, D:\flutter, dst.
               sed -i -E "s#([A-Za-z]:[\\\\/]+flutter)#${FLUTTER_ROOT}#g" "$f"
             done
             echo "✅ Selesai memperbaiki file."
@@ -236,7 +223,6 @@ jobs:
             echo "⚠️ Masih ada referensi Windows:"
             printf '%s\n' "${REMAINING[@]}"
             echo "Mencoba fix paksa..."
-            # Ambil nama file saja (sebelum titik dua pertama)
             mapfile -t REMAINING_FILES < <(printf '%s\n' "${REMAINING[@]}" | cut -d: -f1 | sort -u)
             for f in "${REMAINING_FILES[@]}"; do
               [ -z "$f" ] && continue
@@ -307,6 +293,137 @@ jobs:
           fi
 
           echo "✅ Selesai."
+
+      # ==========================================================
+      # 🔧 UPGRADE compileSdk KE 36
+      # ==========================================================
+      # Plugin package_info_plus, path_provider_android, dll. butuh
+      # compileSdk 36. Flutter akan print warning tapi tetap lanjut;
+      # step ini menghilangkan warning + memastikan kompatibilitas.
+      # ==========================================================
+      - name: Upgrade compileSdk to 36
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          echo "=== Upgrading compileSdk to 36 ==="
+
+          APP_GRADLE=""
+          if [ -f "android/app/build.gradle.kts" ]; then
+            APP_GRADLE="android/app/build.gradle.kts"
+          elif [ -f "android/app/build.gradle" ]; then
+            APP_GRADLE="android/app/build.gradle"
+          fi
+
+          if [ -z "$APP_GRADLE" ]; then
+            echo "ℹ️ File android/app/build.gradle(.kts) tidak ditemukan. Skip."
+            exit 0
+          fi
+
+          echo "📄 Fixing: $APP_GRADLE"
+          echo ""
+          echo "=== Sebelum ==="
+          grep -nE "compileSdk" "$APP_GRADLE" || echo "(tidak ada baris compileSdk)"
+
+          if [[ "$APP_GRADLE" == *.kts ]]; then
+            # Kotlin DSL
+            sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 36/' "$APP_GRADLE"
+            sed -i -E 's/compileSdkVersion[[:space:]]*=[[:space:]]*[0-9]+/compileSdkVersion = 36/' "$APP_GRADLE"
+            # Handle kalau pakai flutter.compileSdkVersion
+            sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*flutter\.compileSdkVersion/compileSdk = 36/' "$APP_GRADLE"
+          else
+            # Groovy DSL
+            sed -i -E 's/compileSdk[[:space:]]+[0-9]+/compileSdk 36/' "$APP_GRADLE"
+            sed -i -E 's/compileSdkVersion[[:space:]]+[0-9]+/compileSdkVersion 36/' "$APP_GRADLE"
+            sed -i -E 's/compileSdk[[:space:]]+flutter\.compileSdkVersion/compileSdk 36/' "$APP_GRADLE"
+            sed -i -E 's/compileSdkVersion[[:space:]]+flutter\.compileSdkVersion/compileSdkVersion 36/' "$APP_GRADLE"
+          fi
+
+          echo ""
+          echo "=== Sesudah ==="
+          grep -nE "compileSdk" "$APP_GRADLE" || echo "(masih tidak ada baris compileSdk)"
+
+          echo "✅ Selesai."
+
+      # ==========================================================
+      # 🩹 AUTO-FIX IMPORT 'package:http/http.dart'
+      # ==========================================================
+      # Error yang muncul:
+      #   lib/dashboard_page.dart:124:36: Error: The getter 'http'
+      #   isn't defined for the type '_DashboardPageState'.
+      #
+      # Penyebab: file .dart pakai http.post / http.get, tapi
+      # tidak ada import 'package:http/http.dart' as http.
+      # Step ini:
+      # 1) Scan semua file .dart yang pakai `http.` tapi tidak import http
+      # 2) Tambah import di baris pertama file tersebut
+      # 3) Pastikan `http:` ada di pubspec.yaml
+      # ==========================================================
+      - name: Auto-fix missing http import
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          echo "=== Auto-fix missing 'http' import ==="
+
+          if [ ! -d "lib" ]; then
+            echo "ℹ️ Folder lib/ tidak ditemukan. Skip."
+            exit 0
+          fi
+
+          # ---------- 1) Scan file .dart yang butuh import http ----------
+          echo ""
+          echo "=== Scan file .dart yang pakai http.* ==="
+
+          mapfile -t HTTP_USERS < <(grep -RIlE '\bhttp\.(get|post|put|delete|patch|head|read|MultipartRequest)' \
+            --include="*.dart" \
+            lib 2>/dev/null || true)
+
+          CLEAN_HTTP_USERS=()
+          for f in "${HTTP_USERS[@]}"; do
+            [ -n "$f" ] && CLEAN_HTTP_USERS+=("$f")
+          done
+
+          if [ "${#CLEAN_HTTP_USERS[@]}" -eq 0 ]; then
+            echo "ℹ️ Tidak ada file .dart yang pakai http.*"
+          else
+            echo "📄 File yang pakai http.*: ${#CLEAN_HTTP_USERS[@]}"
+            printf '   - %s\n' "${CLEAN_HTTP_USERS[@]}"
+
+            for f in "${CLEAN_HTTP_USERS[@]}"; do
+              # Cek apakah sudah import http
+              if grep -qE "import[[:space:]]+['\"]package:http/http\.dart['\"]" "$f"; then
+                echo "  ✅ Sudah import: $f"
+                continue
+              fi
+
+              echo "  🔧 Tambah import: $f"
+              # Sisipkan di baris pertama
+              sed -i "1i import 'package:http/http.dart' as http;" "$f"
+              # Tampilkan 5 baris pertama untuk konfirmasi
+              echo "     --- 5 baris pertama ---"
+              head -5 "$f" | sed 's/^/     /'
+            done
+          fi
+
+          # ---------- 2) Pastikan http ada di pubspec.yaml ----------
+          echo ""
+          echo "=== Cek pubspec.yaml ==="
+
+          if [ -f "pubspec.yaml" ]; then
+            if grep -qE '^[[:space:]]+http[[:space:]]*:' pubspec.yaml; then
+              echo "  ✅ http sudah terdaftar di pubspec.yaml"
+            else
+              echo "  🔧 Menambahkan http ke pubspec.yaml"
+              # Sisipkan setelah baris 'dependencies:' pertama
+              sed -i '/^dependencies:/a\  http: ^1.2.0' pubspec.yaml
+              echo "     --- dependencies (5 baris pertama) ---"
+              sed -n '/^dependencies:/,+5p' pubspec.yaml | sed 's/^/     /'
+            fi
+          else
+            echo "  ⚠️ pubspec.yaml tidak ditemukan, skip."
+          fi
+
+          echo ""
+          echo "=== Selesai auto-fix http ==="
 
       # ==========================================================
       # 🔍 TAHAP ANALYZE — STEP 1
