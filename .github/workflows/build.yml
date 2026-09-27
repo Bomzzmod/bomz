@@ -87,22 +87,47 @@ jobs:
           unzip -q project.zip -d project_raw
 
           echo ""
-          echo "=== Isi folder project_raw ==="
-          find project_raw | head -50
+          echo "=== Isi folder project_raw (depth 3) ==="
+          find project_raw -maxdepth 3 | head -80
 
           echo ""
-          echo "=== Mengunci Project Dir (Manut Mode) ==="
-          
-          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
-          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
-          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
-            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
-          else
-            PROJECT_DIR="project_raw"
-          fi
+          echo "=== Deteksi PROJECT_DIR (loop, handle nested folder) ==="
 
-          echo "✅ Project root langsung dikunci di: $PROJECT_DIR"
+          DETECT_DIR="project_raw"
+
+          # Loop sampai ketemu folder yang punya marker project Flutter/Android,
+          # atau mentok karena strukturnya tidak bisa turun lagi.
+          for i in 1 2 3 4 5; do
+            echo "  [level $i] cek: $DETECT_DIR"
+
+            # Marker project Flutter/Android ditemukan?
+            if [ -f "$DETECT_DIR/pubspec.yaml" ] || \
+               [ -f "$DETECT_DIR/settings.gradle" ] || \
+               [ -f "$DETECT_DIR/settings.gradle.kts" ] || \
+               [ -f "$DETECT_DIR/build.gradle" ] || \
+               [ -f "$DETECT_DIR/build.gradle.kts" ] || \
+               [ -f "$DETECT_DIR/android/settings.gradle" ] || \
+               [ -f "$DETECT_DIR/android/settings.gradle.kts" ]; then
+              echo "  ✅ Marker project ditemukan di: $DETECT_DIR"
+              break
+            fi
+
+            # Kalau cuma 1 subfolder dan tidak ada file, turun satu level
+            SUB_DIR_COUNT=$(find "$DETECT_DIR" -maxdepth 1 -mindepth 1 -type d | wc -l)
+            FILE_COUNT=$(find "$DETECT_DIR" -maxdepth 1 -mindepth 1 -type f | wc -l)
+
+            if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+              DETECT_DIR=$(find "$DETECT_DIR" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+              continue
+            fi
+
+            # Tidak bisa turun lagi
+            echo "  ℹ️ Tidak bisa turun lebih dalam, berhenti di: $DETECT_DIR"
+            break
+          done
+
+          PROJECT_DIR="$DETECT_DIR"
+          echo "✅ Project root final: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
       # =========================
@@ -125,27 +150,21 @@ jobs:
           cache: true
 
       # ==========================================================
-      # 🛠️ FIX FLUTTER SDK PATH (AGGRESSIVE MODE)
+      # 🛠️ FIX FLUTTER SDK PATH (AGGRESSIVE + SPACE-SAFE)
       # ==========================================================
-      # ZIP project sering membawa path Windows hardcoded
-      # (contoh: C:\flutter, C:/flutter, D:\flutter) di
-      # berbagai file konfigurasi Gradle.
-      # Error yang muncul:
-      #   URISyntaxException: Illegal character in opaque part
-      #
-      # Step ini:
-      # 1) Fix android/local.properties
-      # 2) Hapus cache build lama yang ikut ter-zip
-      # 3) Scan & replace SEMUA path Windows Flutter -> Linux
-      # 4) Verifikasi akhir
+      # Menangani:
+      #  - path Windows hardcoded (C:\flutter, D:/flutter)
+      #  - nama folder project yang mengandung SPASI
+      #  - cache build lama yang ikut ter-zip
       # ==========================================================
       - name: Normalize Flutter SDK path
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          echo "=== Normalizing Flutter SDK path (aggressive) ==="
+          echo "=== Normalizing Flutter SDK path (aggressive + space-safe) ==="
           echo "Runner OS: $RUNNER_OS"
           echo "Flutter SDK: $FLUTTER_ROOT"
+          echo "Working dir: $(pwd)"
 
           # ---------- 1) Sanitize android/local.properties ----------
           LOCAL_PROPS="android/local.properties"
@@ -161,19 +180,20 @@ jobs:
             printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT" > "$LOCAL_PROPS"
           fi
 
-          # ---------- 2) Buang cache build lama yang ikut ter-zip ----------
+          # ---------- 2) Buang cache build lama ----------
           echo ""
           echo "=== Membersihkan cache/folder build lama dari ZIP ==="
           rm -rf android/.gradle android/build android/app/build build .dart_tool 2>/dev/null || true
-          find . -name ".gradle" -type d -prune -exec rm -rf {} + 2>/dev/null || true
-          find . -name "build" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name ".gradle" -prune -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "build" -prune -exec rm -rf {} + 2>/dev/null || true
           echo "✅ Cache lama dibersihkan."
 
-          # ---------- 3) Ganti SEMUA path Windows Flutter -> Linux ----------
+          # ---------- 3) Scan file yang mengandung path Windows ----------
           echo ""
           echo "=== Memindai path Windows hardcoded di seluruh project ==="
 
-          FILES_TO_FIX=$(grep -RIlE '([A-Za-z]:[/\\]+flutter)|(C:[/\\]+flutter)' \
+          # Simpan hasil grep ke array supaya aman terhadap spasi pada nama file.
+          mapfile -t FILES_TO_FIX < <(grep -RIlE '[A-Za-z]:[\\/]+flutter' \
             --include="*.gradle" \
             --include="*.properties" \
             --include="*.kts" \
@@ -183,17 +203,22 @@ jobs:
             --include="*.yml" \
             . 2>/dev/null || true)
 
-          if [ -z "$FILES_TO_FIX" ]; then
+          # Buang elemen kosong (jaga-jaga)
+          CLEAN_FILES=()
+          for f in "${FILES_TO_FIX[@]}"; do
+            [ -n "$f" ] && CLEAN_FILES+=("$f")
+          done
+
+          if [ "${#CLEAN_FILES[@]}" -eq 0 ]; then
             echo "✅ Tidak ada path Windows Flutter di file konfigurasi."
           else
-            echo "📄 File yang akan diperbaiki:"
-            echo "$FILES_TO_FIX"
+            echo "📄 File yang akan diperbaiki: ${#CLEAN_FILES[@]}"
+            printf '   - %s\n' "${CLEAN_FILES[@]}"
 
-            for f in $FILES_TO_FIX; do
+            for f in "${CLEAN_FILES[@]}"; do
               echo "  🔧 Fix: $f"
-              sed -i -E \
-                "s#([A-Za-z]:[\\\\/]+flutter)#${FLUTTER_ROOT}#g" \
-                "$f"
+              # Ganti semua variasi C:\flutter, C:/flutter, D:\flutter, dst.
+              sed -i -E "s#([A-Za-z]:[\\\\/]+flutter)#${FLUTTER_ROOT}#g" "$f"
             done
             echo "✅ Selesai memperbaiki file."
           fi
@@ -201,35 +226,42 @@ jobs:
           # ---------- 4) Verifikasi ----------
           echo ""
           echo "=== Verifikasi akhir: cek sisa path Windows ==="
-          REMAINING=$(grep -RInE '([A-Za-z]:[\\/]+flutter)' \
+          mapfile -t REMAINING < <(grep -RInE '[A-Za-z]:[\\/]+flutter' \
             --include="*.gradle" \
             --include="*.properties" \
             --include="*.kts" \
             . 2>/dev/null || true)
 
-          if [ -n "$REMAINING" ]; then
+          if [ "${#REMAINING[@]}" -gt 0 ] && [ -n "${REMAINING[0]}" ]; then
             echo "⚠️ Masih ada referensi Windows:"
-            echo "$REMAINING"
+            printf '%s\n' "${REMAINING[@]}"
             echo "Mencoba fix paksa..."
-            echo "$REMAINING" | while IFS=: read -r file line rest; do
-              sed -i -E "s#([A-Za-z]:[\\\\/]+flutter)#${FLUTTER_ROOT}#g" "$file"
+            # Ambil nama file saja (sebelum titik dua pertama)
+            mapfile -t REMAINING_FILES < <(printf '%s\n' "${REMAINING[@]}" | cut -d: -f1 | sort -u)
+            for f in "${REMAINING_FILES[@]}"; do
+              [ -z "$f" ] && continue
+              [ -f "$f" ] || continue
+              echo "  🔧 Paksa fix: $f"
+              sed -i -E "s#([A-Za-z]:[\\\\/]+flutter)#${FLUTTER_ROOT}#g" "$f"
             done
           else
             echo "✅ Bersih. Tidak ada path Windows tersisa."
           fi
 
           echo ""
-          echo "=== Isi android/settings.gradle (spot check) ==="
+          echo "=== Spot check android/settings.gradle ==="
           if [ -f "android/settings.gradle" ]; then
             grep -nE "flutter|includeBuild|pluginManagement" android/settings.gradle | head -20
           fi
 
+          echo ""
+          echo "=== Spot check android/local.properties ==="
+          if [ -f "android/local.properties" ]; then
+            cat android/local.properties
+          fi
+
       # ==========================================================
       # 🧠 FIX GRADLE MEMORY & WRAPPER
-      # ==========================================================
-      # Menghindari error:
-      #   "The maximum heap size is insufficient"
-      #   "Gradle version X is not compatible with AGP Y"
       # ==========================================================
       - name: Fix Gradle Memory & Wrapper
         working-directory: ${{ env.PROJECT_DIR }}
@@ -244,8 +276,6 @@ jobs:
 
           GRADLE_PROPS="android/gradle.properties"
 
-          # Buang konfigurasi org.gradle.jvmargs lama (kalau ada),
-          # lalu tulis baru dengan heap 4 GB.
           if [ -f "$GRADLE_PROPS" ]; then
             grep -vE '^[[:space:]]*org\.gradle\.jvmargs[[:space:]]*=' "$GRADLE_PROPS" > "$GRADLE_PROPS.tmp" || true
             mv "$GRADLE_PROPS.tmp" "$GRADLE_PROPS"
@@ -265,7 +295,6 @@ jobs:
           echo "✅ gradle.properties diperbarui:"
           cat "$GRADLE_PROPS"
 
-          # Paksa Gradle wrapper ke 8.9 (kompatibel dengan Flutter 3.41+ / AGP 8.x)
           if [ -f "android/gradlew" ]; then
             echo ""
             echo "=== Forcing Gradle wrapper to 8.9 ==="
@@ -312,7 +341,6 @@ jobs:
         if: ${{ github.event.inputs.only_analyze == 'true' }}
         run: |
           echo "Analyze-only mode aktif. Workflow dihentikan di sini."
-          # exit 0 = success, karena ini bukan error, cuma mode stop.
           exit 0
 
       # =========================
